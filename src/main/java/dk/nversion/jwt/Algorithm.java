@@ -4,9 +4,9 @@ public enum Algorithm {
 	HS256("HmacSHA256"),
     HS384("HmacSHA384"),
     HS512("HmacSHA512"),
-    RS256("RS256"),
-    RS384("RS384"),
-    RS512("RS512");
+    RS256("SHA256withRSA"),
+    RS384("SHA384withRSA"),
+    RS512("SHA512withRSA");
 
     private final String value;
     

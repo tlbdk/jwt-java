@@ -8,14 +8,19 @@ import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.SignatureException;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
 import java.util.Arrays;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.lang3.StringUtils;
 
-public class JWT {
+public class JWT {    
     private static class Header {
         @JsonProperty("alg")
         private Algorithm algorithm;
@@ -33,9 +38,9 @@ public class JWT {
         @JsonProperty("aud")
         private String audience;
         @JsonProperty("exp")
-        private long expires;
+        private long expires = -1;
         @JsonProperty("nbf")
-        private long notBefore;
+        private long notBefore = -1;
         @JsonProperty("sub")
         private String subject;
     }
@@ -43,8 +48,11 @@ public class JWT {
     private Header header;
     private Body body;
     
-    private byte[] key;
-    private X509Certificate certificate;
+    private byte[] sharedkey;
+    private PrivateKey privatekey;
+    
+    private int notBeforeMax = 600;
+    private int expiresMax = 6000;
     
     public JWT() {
         this.body = new Body();
@@ -67,25 +75,36 @@ public class JWT {
         this.body = new Body();
         this.header = new Header();
         this.header.algorithm = algorithm;
-        this.key = key;
+        this.sharedkey = key;
     }
     
-    public JWT(Algorithm algorithm, X509Certificate certificate) throws JWTException {
-        
+    public JWT(Algorithm algorithm, PrivateKey privatekey) throws JWTException {
         if(algorithm.name().startsWith("HS")) {
             throw new JWTException("This algorithm needs a shared key");
+        }
+        if(privatekey == null) {
+             throw new JWTException("Private key can not be null");
         }
         
         this.body = new Body();
         this.header = new Header();
         this.header.algorithm = algorithm;
+        this.privatekey = privatekey;
     }
     
-    public JWT(String token, String key) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException {
-        this(token, key.getBytes(StandardCharsets.UTF_8));
+    public JWT(String token, String key, String audience) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException, SignatureException {
+        this(token, key.getBytes(StandardCharsets.UTF_8), null, audience);
     }
     
-    public JWT(String token, byte [] key) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException {
+    public JWT(String token, byte [] key, String audience) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException, SignatureException {
+        this(token, key, null, audience);
+    }
+    
+    public JWT(String token, PublicKey key, String audience) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException, SignatureException {
+        this(token, null, key, audience);
+    }
+    
+    private JWT(String token, byte [] sharedkey, PublicKey publickey, String audience) throws JWTException, IOException, InvalidKeyException, NoSuchAlgorithmException, SignatureException {
         if(StringUtils.countMatches(token, ".") != 2) {
             throw new JWTException("Not a valid JWT token as it does not contain two dots");
         }
@@ -98,31 +117,61 @@ public class JWT {
         this.header = mapper.readValue(Base64.decodeBase64(token.substring(0, header_offset)), Header.class);
         this.body = mapper.readValue(Base64.decodeBase64(token.substring(header_offset + 1, body_offset)), Body.class);
         byte[] signature_bytes = Base64.decodeBase64(token.substring(body_offset + 1, token.length()));
+        byte[] header_body_bytes = Arrays.copyOfRange(token.getBytes(StandardCharsets.UTF_8), 0, body_offset);
         
-        byte[] calculated_signature_bytes;
         switch (header.algorithm) {
             case HS256:
             case HS384:
-            case HS512:
+            case HS512: {
+                // Calculate the signature
                 Mac mac = Mac.getInstance(header.algorithm.getValue());
-                mac.init(new SecretKeySpec(key, header.algorithm.getValue()));
-                calculated_signature_bytes = mac.doFinal(Arrays.copyOfRange(token.getBytes(StandardCharsets.UTF_8), 0, body_offset));
+                mac.init(new SecretKeySpec(sharedkey, header.algorithm.getValue()));
+                byte[] calculated_signature_bytes = mac.doFinal(header_body_bytes);
+                // Validate signature with a time safe comparison
+                if(!MessageDigest.isEqual(signature_bytes, calculated_signature_bytes)) {
+                    throw new JWTException("Signature validation failed");
+                }
                 break;
+            }
             case RS256:
             case RS384:
-            case RS512:
-                throw new JWTException("Not supported");
-            default:
+            case RS512: {
+                Signature signature = Signature.getInstance(header.algorithm.getValue());
+                signature.initVerify(publickey);
+                signature.update(header_body_bytes);
+                if(!signature.verify(signature_bytes)) {
+                    throw new JWTException("Signature validation failed");
+                }
+                break;
+            }
+            default: {
                 throw new JWTException("Unsupported signing method");
+            }
+        }
+
+        // Validate that this token was intented for us
+        if(audience != null && (body.audience == null || !audience.equals(body.audience))) {
+            throw new JWTException("Audience not set in token or did not match");
         }
         
-        if(!MessageDigest.isEqual(signature_bytes, calculated_signature_bytes)) {
-            throw new JWTException("Signature validation failed");
+        // Validate with have both expires and notbefore set
+        if(body.notBefore == -1 || body.expires == -1) {
+            throw new JWTException("The token needs to have both a nbf and exp to be accepted");
         }
         
+        long unixtime = Instant.now().getEpochSecond();
+        // Validate that the token is valid
+        if(body.notBefore >= unixtime) {
+            throw new JWTException("Token is not valid yet");
+        }
+        
+        // Validate that the token has not expired
+        if(body.expires <= unixtime) {
+            throw new JWTException("Token has expired");
+        }
     }
     
-    public String encode() throws JWTException, JsonProcessingException, NoSuchAlgorithmException, InvalidKeyException {
+    public String encode() throws JWTException, JsonProcessingException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
             // Convert header and body to Base64URL encoded JSON bytes
             ObjectMapper mapper = new ObjectMapper();
             byte[] header_bytes = Base64.encodeBase64URLSafe(mapper.writeValueAsBytes(header));
@@ -139,17 +188,24 @@ public class JWT {
             switch (header.algorithm) {
                 case HS256:
                 case HS384:
-                case HS512:
+                case HS512: {
                     Mac mac = Mac.getInstance(header.algorithm.getValue());
-                    mac.init(new SecretKeySpec(key, header.algorithm.getValue()));
+                    mac.init(new SecretKeySpec(sharedkey, header.algorithm.getValue()));
                     signature_bytes = Base64.encodeBase64URLSafe(mac.doFinal(header_body_bytes));
                     break;
+                }
                 case RS256:
                 case RS384:
-                case RS512:
-                    throw new JWTException("Not supported");
-                default:
+                case RS512: {
+                    Signature signature = Signature.getInstance(header.algorithm.getValue());
+                    signature.initSign(privatekey);
+                    signature.update(header_body_bytes);
+                    signature_bytes = Base64.encodeBase64URLSafe(signature.sign());
+                    break;
+                }
+                default: {
                     throw new JWTException("Unsupported signing method");
+                }
             }
             
             // Create final token : header.body.signature
